@@ -22,6 +22,15 @@ if __name__ == "__main__":
     game = GameState(logging=args.logging)
     api_thread = threading.Thread(target=api, args=(game,), daemon=True)
     api_thread.start()
-
-    # run main game loop
-    game_loop(game)
+    # run main game loop and ensure pygame quits cleanly on interrupt/errors
+    try:
+        game_loop(game)
+    except KeyboardInterrupt:
+        # allow graceful exit with Ctrl-C
+        print("Interrupted, shutting down...")
+    finally:
+        try:
+            import pygame
+            pygame.quit()
+        except Exception:
+            pass

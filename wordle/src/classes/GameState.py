@@ -6,11 +6,36 @@ from enum import Enum
 from threading import Timer
 
 import pygame
-from firebase_admin.firestore import firestore
-from google import genai
-from openai import OpenAI, OpenAIError
-from openai.types.chat import ChatCompletionMessageParam
-from ollama import chat, ChatResponse
+from typing import Any, TYPE_CHECKING
+
+# Optional SDKs — import defensively so the game can run without them installed
+try:
+    from firebase_admin.firestore import firestore
+except Exception:
+    firestore = None
+
+try:
+    from google import genai
+except Exception:
+    genai = None
+
+try:
+    from openai import OpenAI, OpenAIError
+    # ChatCompletionMessageParam is a typing aid; fall back to Any if not present
+    try:
+        from openai.types.chat import ChatCompletionMessageParam
+    except Exception:
+        ChatCompletionMessageParam = Any
+except Exception:
+    OpenAI = None
+    OpenAIError = Exception
+    ChatCompletionMessageParam = Any
+
+try:
+    from ollama import chat, ChatResponse
+except Exception:
+    chat = None
+    ChatResponse = Any
 
 from assets.guess_words import GUESS_WORDS
 from classes.Button import Button
@@ -40,6 +65,9 @@ class Status(Enum):
 class GameState:
     def __init__(self, show_window: bool = True, disable_animations: bool = False, logging: bool = True):
         self.db: firestore.Client | None = None
+
+        # default api/key state
+        self.api_key_valid = False
 
         if logging:
             try:
@@ -80,8 +108,10 @@ class GameState:
             try:
                 self.ai_client = OpenAI()
                 self.api_key_valid = True
+                self.llm_available = True
             except OpenAIError:
                 self.api_key_valid = False
+                self.llm_available = False
 
         self.gemini_client: genai.Client | None = None
         if self.llm_platform == "gemini":
@@ -90,13 +120,17 @@ class GameState:
                     api_key=os.getenv("GEMINI_API_KEY", default="")
                 )
                 self.api_key_valid = True
+                self.llm_available = True
             except:
                 self.api_key_valid = False
+                self.llm_available = False
 
         self.total_llm_guesses = []
         self.ai_loading = False
         self.error_message = ""
         self.error_message_visible = False
+        # whether remote LLM calls should be attempted
+        self.llm_available = True
 
         self.solver = Solver()
         self.solver_active = False
@@ -138,27 +172,31 @@ class GameState:
         if self.show_window:
             # make sure buttons are in correct position
             border_offset_x = calculate_dynamic_widths(self.num_guesses)[1]
-            self.solve_button.rect = pygame.Rect(
+            if self.solve_button:
+                self.solve_button.rect = pygame.Rect(
                 border_offset_x, LETTER_GRID_HEIGHT + 40,
                 (LETTER_GRID_WIDTH - border_offset_x * 2) / 2 - 2, 40
             )
-            self.hint_button.rect = pygame.Rect(
+            if self.hint_button:
+                self.hint_button.rect = pygame.Rect(
                 border_offset_x + (LETTER_GRID_WIDTH -
                                    border_offset_x * 2) / 2 + 3, LETTER_GRID_HEIGHT + 40,
                 (LETTER_GRID_WIDTH - border_offset_x * 2) / 4 - 3, 40
             )
             bg = (83, 141, 78) if self.api_key_valid else (100, 100, 100)
             tc = (255, 255, 255) if self.api_key_valid else (200, 200, 200)
-            self.llm_hint_button.rect = pygame.Rect(
+            if self.llm_hint_button:
+                self.llm_hint_button.rect = pygame.Rect(
                 3 * LETTER_GRID_WIDTH / 4 - border_offset_x / 2 + 5, LETTER_GRID_HEIGHT + 40,
                 (LETTER_GRID_WIDTH - border_offset_x * 2) / 4 - 3, 40
             )
-            self.llm_hint_button.color = bg
-            self.llm_hint_button.text_color = tc
+                self.llm_hint_button.color = bg
+                self.llm_hint_button.text_color = tc
 
-            for row in self.keyboard:
-                for button in row:
-                    button.feedback = None
+            if self.keyboard:
+                for row in self.keyboard:
+                    for button in row:
+                        button.feedback = None
 
         possible_positions = [i for i in range(WORD_LENGTH)]
         self.lie_indexes.clear()
@@ -233,6 +271,30 @@ class GameState:
 
     def enter_word_from_ai(self, messages: list[ChatCompletionMessageParam] | None = None, calls: int = 0):
         self.ai_loading = True
+        # If we've previously detected the LLM is unavailable (quota/billing),
+        # fall back to the local solver immediately to avoid repeated failed API calls.
+        if not getattr(self, 'llm_available', True):
+            try:
+                fallback_guess = self.solver.get_guess()
+                print(f"[Fallback] LLM unavailable; solver will guess: {fallback_guess}")
+                self.total_llm_guesses.append({
+                    "guess": fallback_guess.upper(),
+                    "retries": 0,
+                    "accepted": False,
+                    "previous_guesses": [
+                        word.guessed_word for word in self.words if word.locked
+                    ],
+                    "step": self.num_of_tries() + 1,
+                    "fallback": True,
+                })
+                self.enter_word_from_solver(fallback_guess, check=(not self.show_window))
+            except Exception as fallback_exc:
+                print("Fallback solver failed:", fallback_exc)
+                raise
+            finally:
+                self.ai_loading = False
+
+            return
 
         try:
             messages = messages or generate_messages(
@@ -274,8 +336,12 @@ class GameState:
                 )
 
             elif self.llm_platform == "ollama":
+                if not chat:
+                    raise Exception("Ollama python package not available")
+
+                model_to_use = getattr(self, 'ollama_model', None) or OLLAMA_MODEL
                 completion: ChatResponse = chat(
-                    model=OLLAMA_MODEL,
+                    model=model_to_use,
                     messages=messages
                 )
                 org_response = str(completion.message.content)
@@ -318,13 +384,56 @@ class GameState:
                 print("Error: AI did not return a valid guess")
 
         except Exception as e:
-            self.error_message = str(e)
+            # Handle API-related failures gracefully. If OpenAI (or other LLM)
+            # reports quota/billing errors or any network/SDK error, fall back
+            # to the local Solver so the game can continue.
+            msg = str(e)
+            self.error_message = msg
             self.error_message_visible = True
             Timer(ERROR_MESSAGE_VISIBLE_TIME, lambda: setattr(
                 self, "error_message_visible", False)).start()
+
+            # Detect common quota/billing message fragments to show clearer guidance
+            low_quota = False
+            try:
+                from openai import OpenAIError as _OpenAIError  # local import for type check
+            except Exception:
+                _OpenAIError = None
+
+            if (_OpenAIError and isinstance(e, _OpenAIError)) or 'quota' in msg.lower() or 'insufficient_quota' in msg.lower() or 'billing' in msg.lower():
+                low_quota = True
+
             if self.show_window:
-                print(e)
+                print("LLM request failed:", msg)
+                if low_quota:
+                    print("Falling back to local solver due to quota/billing issue. Check your OpenAI account.")
+                    # mark remote LLM unavailable to avoid repeated failed calls
+                    self.llm_available = False
             else:
+                # in headless mode re-raise non-API errors, but still try fallback for quota
+                if not low_quota:
+                    raise e
+
+            # Fallback: use the local solver to generate a guess so the game continues
+            try:
+                fallback_guess = self.solver.get_guess()
+                print(f"[Fallback] Solver will guess: {fallback_guess}")
+                self.total_llm_guesses.append({
+                    "guess": fallback_guess.upper(),
+                    "retries": 0,
+                    "accepted": False,
+                    "previous_guesses": [
+                        word.guessed_word for word in self.words if word.locked
+                    ],
+                    "step": self.num_of_tries() + 1,
+                    "fallback": True,
+                    "error": msg,
+                })
+                # Enter the solver guess into the game
+                self.enter_word_from_solver(fallback_guess, check=(not self.show_window))
+            except Exception as fallback_exc:
+                # If fallback also fails, raise the original exception to surface the error
+                print("Fallback solver also failed:", fallback_exc)
                 raise e
 
         self.ai_loading = False
@@ -335,13 +444,21 @@ class GameState:
             if llm == "openai":
                 self.ai_client = OpenAI()
                 self.api_key_valid = True
+                self.llm_available = True
             elif llm == "gemini":
                 self.gemini_client = genai.Client(
                     api_key=os.getenv("GEMINI_API_KEY", default="")
                 )
                 self.api_key_valid = True
+                self.llm_available = True
+            elif llm == "ollama":
+                # Ollama is a local model runner — no client init required here.
+                # We just mark it available so the rest of the code will use it.
+                self.api_key_valid = True
+                self.llm_available = True
         except:
             self.api_key_valid = False
+            self.llm_available = False
 
     def clear_guess(self):
         for _ in range(WORD_LENGTH):
@@ -353,6 +470,8 @@ class GameState:
             return
 
         if self.num_lies > 0:
+            return
+        if not self.keyboard:
             return
 
         for i in range(len(word)):
@@ -414,9 +533,10 @@ class GameState:
                 for word in self.words:
                     word.draw_word(self.screen, self.num_guesses)
 
-                for row in self.keyboard:
-                    for button in row:
-                        button.draw(self.screen)
+                if self.keyboard:
+                    for row in self.keyboard:
+                        for button in row:
+                            button.draw(self.screen)
 
                 text = f'Beware the {str(self.num_lies) + " lies" if self.num_lies != 1 else "lie"}...'\
                     if self.num_lies > 0 else f'Guess the {WORD_LENGTH} letter word.'
@@ -424,15 +544,15 @@ class GameState:
                 draw_text('Franklin Gothic', 40, text,
                           (LETTER_GRID_WIDTH / 2, LETTER_GRID_HEIGHT + 15), (58, 58, 60), self.screen)
 
-                if self.solve_button.draw_button(self.screen):
+                if self.solve_button and self.solve_button.draw_button(self.screen):
                     self.solver_active = True
                     self.enter_word_from_solver()
 
-                if self.hint_button.draw_button(self.screen):
+                if self.hint_button and self.hint_button.draw_button(self.screen):
                     self.enter_single_guess_from_solver(
                         check=(not self.show_window))
 
-                if self.llm_hint_button.draw_button(self.screen):
+                if self.llm_hint_button and self.llm_hint_button.draw_button(self.screen):
                     threading.Thread(
                         target=(lambda game: game.enter_word_from_ai()), args=(self,)
                     ).start()
@@ -453,21 +573,25 @@ class GameState:
         pygame.display.update()
 
         # disable keyboard buttons if game is over
-        for row in self.keyboard:
-            for button in row:
-                # disable button if game is over
-                button.disabled = self.status != Status.game
+        if self.keyboard:
+            for row in self.keyboard:
+                for button in row:
+                    # disable button if game is over
+                    button.disabled = self.status != Status.game
 
         # disable button if game is over
-        self.solve_button.disabled = self.status != Status.game
+        if self.solve_button:
+            self.solve_button.disabled = self.status != Status.game
 
         # disable button if game is over
-        self.hint_button.disabled = self.status != Status.game
+        if self.hint_button:
+            self.hint_button.disabled = self.status != Status.game
 
         # disable button if game is over or api key is not valid
-        self.llm_hint_button.disabled = (
-            self.status != Status.game or not self.api_key_valid or self.ai_loading
-        )
+        if self.llm_hint_button:
+            self.llm_hint_button.disabled = (
+                self.status != Status.game or not self.api_key_valid or self.ai_loading
+            )
 
     def num_of_tries(self):
         return len([word for word in self.words if word.locked])
