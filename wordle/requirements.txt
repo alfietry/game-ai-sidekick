@@ -1,0 +1,10 @@
+pygame
+pytest
+pyinstaller
+openai
+google-genai
+wandb
+firebase-admin
+pytz
+ollama
+requests

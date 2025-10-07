@@ -55,5 +55,9 @@ OLLAMA_MODEL = "gemma3:4b"
 MAX_LLM_CONTINUOUS_CALLS = 5
 
 LLM_PLATFORM = "ollama"
+<<<<<<< Updated upstream
+=======
+LLM_API_ENDPOINT = "http://localhost:8080/predict"  # default to local mock server for contributors
+>>>>>>> Stashed changes
 LOG_LLM_MESSAGES = False
 ERROR_MESSAGE_VISIBLE_TIME = 5

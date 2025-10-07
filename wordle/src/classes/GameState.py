@@ -6,6 +6,13 @@ from enum import Enum
 from threading import Timer
 
 import pygame
+<<<<<<< Updated upstream
+=======
+try:
+    import requests
+except Exception:
+    requests = None
+>>>>>>> Stashed changes
 from typing import Any, TYPE_CHECKING
 
 # Optional SDKs — import defensively so the game can run without them installed
@@ -103,6 +110,8 @@ class GameState:
         self.was_valid_guess = False
 
         self.llm_platform = LLM_PLATFORM
+        # custom endpoint (can be set via env LLM_API_ENDPOINT or at runtime)
+        self.llm_api_endpoint = os.getenv("LLM_API_ENDPOINT", default=LLM_API_ENDPOINT)
         self.ai_client: OpenAI | None = None
         if self.llm_platform == "openai":
             try:
@@ -124,6 +133,12 @@ class GameState:
             except:
                 self.api_key_valid = False
                 self.llm_available = False
+<<<<<<< Updated upstream
+=======
+
+        if self.llm_platform == "ollama":
+            self.api_key_valid = True
+>>>>>>> Stashed changes
 
         self.total_llm_guesses = []
         self.ai_loading = False
@@ -346,6 +361,29 @@ class GameState:
                 )
                 org_response = str(completion.message.content)
 
+            elif self.llm_platform == "custom":
+                # Custom HTTP endpoint: expect a POST that accepts JSON {"messages": [...]}
+                if not self.llm_api_endpoint:
+                    raise Exception("No LLM API endpoint configured for custom platform")
+                if not requests:
+                    raise Exception("requests package is not available")
+
+                payload = {"messages": messages}
+                try:
+                    resp = requests.post(self.llm_api_endpoint, json=payload, timeout=30)
+                    resp.raise_for_status()
+                    body = resp.json()
+                    # Support a couple of common response shapes: {"guess": "word"} or {"response": "text"}
+                    if isinstance(body, dict) and 'guess' in body:
+                        org_response = str(body['guess'])
+                    elif isinstance(body, dict) and 'response' in body:
+                        org_response = str(body['response'])
+                    else:
+                        # fallback to raw text
+                        org_response = resp.text
+                except Exception as http_e:
+                    raise Exception(f"Custom LLM request failed: {http_e}")
+
             if LOG_LLM_MESSAGES:
                 with open("./llm_chat_log.txt", "a") as f:
                     f.write("{" + org_response + "}" + "\n")
@@ -360,6 +398,41 @@ class GameState:
                 completion_message = ""
 
             if len(completion_message) == WORD_LENGTH:
+                # Avoid repeating previous guesses. Collect prior guesses from
+                # locked words and prior LLM attempts.
+                prior_guesses = set(
+                    [word.guessed_word for word in self.words if word.locked]
+                )
+                prior_guesses.update({g["guess"] for g in self.total_llm_guesses if "guess" in g})
+
+                if completion_message.upper() in prior_guesses:
+                    # Duplicate guess: retry with the LLM if we have retries left,
+                    # else fall back to the solver.
+                    if calls < MAX_LLM_CONTINUOUS_CALLS:
+                        messages.append({
+                            "role": "system",
+                            "content": "Do not repeat previous guesses. Provide a different 5-letter word."
+                        })
+                        # ask LLM again
+                        self.enter_word_from_ai(messages, calls + 1)
+                        self.ai_loading = False
+                        return
+                    else:
+                        # Exhausted retries; fall back to solver
+                        fallback_guess = self.solver.get_guess()
+                        print(f"[Fallback] LLM repeated guesses; solver will guess: {fallback_guess}")
+                        self.total_llm_guesses.append({
+                            "guess": fallback_guess.upper(),
+                            "retries": 0,
+                            "accepted": False,
+                            "previous_guesses": [word.guessed_word for word in self.words if word.locked],
+                            "step": self.num_of_tries() + 1,
+                            "fallback": True,
+                        })
+                        self.enter_word_from_solver(fallback_guess, check=(not self.show_window))
+                        self.ai_loading = False
+                        return
+
                 reasons = self.solver.reason_guess(completion_message)
                 messages.append({"role": "assistant", "content": org_response})
 

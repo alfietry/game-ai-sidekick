@@ -1,4 +1,8 @@
 import os # needed to set OpenAI API key at runtime
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes
 import re
 
 from pygame import time
@@ -107,19 +111,59 @@ def api(game: GameState):
                 setattr(game, 'ollama_model', model)
                 print(f"Ollama model set to {model} for this game instance")
 
+<<<<<<< Updated upstream
+=======
+            case 'set-llm-endpoint':
+                # usage: set-llm-endpoint <url>
+                if len(args) < 1 or not args[0]:
+                    print("Error: Missing endpoint URL")
+                    continue
+
+                url = args[0]
+                # persist in environment and on the running GameState
+                os.environ["LLM_API_ENDPOINT"] = url
+                try:
+                    setattr(game, 'llm_api_endpoint', url)
+                except Exception:
+                    pass
+                print(f"LLM API endpoint set to {url}")
+
+>>>>>>> Stashed changes
             case 'ai-play':
                 # let the configured LLM play the current game until completion
                 if game.status != Status.game:
                     print("Error: No active game\n")
                     continue
 
+<<<<<<< Updated upstream
                 if game.llm_platform != "openai" and game.llm_platform != "gemini" and game.llm_platform != "ollama":
+=======
+                if game.llm_platform != "openai" and game.llm_platform != "gemini" and game.llm_platform != "ollama" and game.llm_platform != "custom":
+>>>>>>> Stashed changes
                     print("Error: Unsupported LLM platform configured")
                     continue
 
                 # simple loop: ask the LLM to make guesses until the game ends
                 while game.status != Status.end:
                     game.enter_word_from_ai()
+<<<<<<< Updated upstream
+=======
+                    # In windowed mode enter_word_from_ai() may not call the
+                    # synchronous check (it defers checking to avoid blocking UI).
+                    # For ai-play we need to submit the guess for checking so
+                    # feedback becomes available and tries increment.
+                    try:
+                        if game.show_window:
+                            # only trigger check if the current word appears complete
+                            if game.words[game.current_word_index].word_complete():
+                                game.handle_check_word()
+                            else:
+                                # still attempt to trigger a check to be safe
+                                game.handle_check_word()
+                    except Exception:
+                        # best-effort; if this fails the fallback solver will continue
+                        pass
+>>>>>>> Stashed changes
 
                     delay = FEEDBACK_DIFF_DURATION * 4 + ANIMATION_DURATION + \
                         100 if not game.disable_animations else 0
